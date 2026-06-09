@@ -9,6 +9,8 @@
 #   branchnew            split right + fork, auto-named newBranch1, newBranch2, …
 #   branchnew <name>     split right + fork, named <name> (verbatim, no number)
 #   branchnew --help     show help
+#   branchnew --record   (internal) record this pane's iTerm-guid ↔ session map for
+#                        the hotkey fork daemon; called by Claude hooks, not by you.
 #
 # Backend is auto-detected: tmux (real split) > iTerm2 (native split) >
 # Apple Terminal (can't split → new window) > anything else (new Terminal window).
@@ -21,6 +23,56 @@
 # session in $PWD.
 
 emulate -L zsh
+
+# ── Internal: `branchnew --record` (merged from the former standalone
+# branchnew-record). Called by Claude SessionStart / UserPromptSubmit hooks to
+# remember which Claude session lives in which iTerm pane, so the iTerm hotkey
+# daemon (iterm2/claude_fork.py) can fork the exact session in a pane. Not for
+# interactive use — see HOTKEY-FORK.md. Writes two lines (session id, cwd) to
+# ${XDG_STATE_HOME:-~/.local/state}/branchnew/iterm/<iterm-guid>.
+if [[ "${1:-}" == "--record" ]]; then
+  state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
+  dir="$state/iterm"
+  mkdir -p "$dir" 2>/dev/null
+
+  # iTerm pane GUID = the part after ':' in $ITERM_SESSION_ID; it equals what the
+  # iTerm2 Python API reports as session.session_id.
+  src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
+  guid="${src##*:}"
+
+  # Hook JSON (session_id / cwd / hook_event_name / transcript_path) on stdin.
+  json_sid="" cwd="" event="" tpath=""
+  if [[ ! -t 0 ]]; then
+    json="$(cat 2>/dev/null)"
+    if [[ -n "$json" ]]; then
+      PY="$(command -v python3 || print -- /usr/bin/python3)"
+      parsed="$(print -r -- "$json" | "$PY" -c 'import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get("session_id", ""))
+    print(d.get("cwd", ""))
+    print(d.get("hook_event_name", ""))
+    print(d.get("transcript_path", ""))
+except Exception:
+    print(); print(); print(); print()' 2>/dev/null)"
+      lines=("${(@f)parsed}")
+      json_sid="${lines[1]:-}"; cwd="${lines[2]:-}"; event="${lines[3]:-}"; tpath="${lines[4]:-}"
+    fi
+  fi
+
+  # Prefer the transcript-derived id (the real .jsonl in use) so a fork resolves
+  # to the FORK's own id; then the live env id; then the JSON session_id.
+  tid=""
+  [[ -n "$tpath" ]] && tid="${tpath:t:r}"
+  sid="${tid:-${CLAUDE_CODE_SESSION_ID:-$json_sid}}"
+  [[ -n "$cwd" ]] || cwd="${PWD:-}"
+
+  print -r -- "$(date '+%F %T') event=${event:-?} json_sid=${json_sid:-NONE} tid=${tid:-NONE} env_sid=${CLAUDE_CODE_SESSION_ID:-NONE} guid=${guid:-NONE}" >> "$state/record.log" 2>/dev/null
+
+  [[ -n "$guid" && -n "$sid" ]] || exit 0
+  { print -r -- "$sid"; print -r -- "$cwd"; } > "$dir/$guid"
+  exit 0
+fi
 
 # ── Args: --help → help; one-or-more args → that name; no args → auto name. ────
 case "${1:-}" in

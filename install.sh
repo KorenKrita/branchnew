@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# branchnew installer — copies ./branchnew into ~/.local/bin, makes it
-# executable, and ensures ~/.local/bin is on your PATH.
+# branchnew installer
+#   ./install.sh            install the `branchnew` command into ~/.local/bin
+#   ./install.sh --hotkey   ALSO install the iTerm2 ⌃⌥⌘F fork daemon
+#                           (see HOTKEY-FORK.md)
 #
 set -euo pipefail
 
@@ -37,6 +39,23 @@ esac
 # Friendly heads-up if the claude CLI isn't visible yet.
 if ! command -v claude >/dev/null 2>&1; then
   echo "! note: 'claude' was not found on PATH — install Claude Code so branchnew has something to launch."
+fi
+
+# ── Optional: the iTerm2 hotkey (⌃⌥⌘F) fork daemon. ───────────────────────────
+if [[ "${1:-}" == "--hotkey" ]]; then
+  AL="$HOME/Library/Application Support/iTerm2/Scripts/AutoLaunch"
+  mkdir -p "$AL"
+  install -m 0644 "$SRC_DIR/iterm2/claude_fork.py" "$AL/claude_fork.py"
+  echo "✓ installed iTerm2 hotkey daemon: $AL/claude_fork.py"
+  echo
+  echo "To finish hotkey (⌃⌥⌘F) setup:"
+  echo "  1. iTerm2 → Settings → General → Magic → enable \"Enable Python API\""
+  echo "  2. Add these two hooks to ~/.claude/settings.json (one command each):"
+  echo "        SessionStart     →  $DEST --record"
+  echo "        UserPromptSubmit →  $DEST --record"
+  echo "  3. Restart iTerm2 (allow the script when prompted), start a Claude"
+  echo "     session, then press ⌃⌥⌘F in that pane."
+  echo "  See HOTKEY-FORK.md for details."
 fi
 
 echo
