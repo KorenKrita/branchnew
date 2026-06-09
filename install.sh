@@ -1,33 +1,48 @@
 #!/usr/bin/env bash
 #
-# branchnew installer
-#   ./install.sh            install the `branchnew` command into ~/.local/bin
-#   ./install.sh --hotkey   ALSO install the iTerm2 ⌃⌥⌘F fork daemon
-#                           (see HOTKEY-FORK.md)
+# branchnew installer.
+#
+# One-liner (no clone needed):
+#   curl -fsSL https://raw.githubusercontent.com/limin112/branchnew/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/limin112/branchnew/main/install.sh | bash -s -- --hotkey
+# From a clone:
+#   ./install.sh [--hotkey]
+#
+# Base install : the `branchnew` command + the `/branchnew` slash command.
+# --hotkey also: the iTerm2 ⌃⌥⌘F fork daemon, and it wires the Claude hooks for you.
 #
 set -euo pipefail
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  echo "branchnew is macOS-only (it drives iTerm2 / Apple Terminal via AppleScript)." >&2
-  exit 1
+REPO_RAW="https://raw.githubusercontent.com/limin112/branchnew/main"
+
+[[ "$(uname)" == "Darwin" ]] || { echo "branchnew is macOS-only." >&2; exit 1; }
+
+WANT_HOTKEY=0
+[[ "${1:-}" == "--hotkey" ]] && WANT_HOTKEY=1
+
+# Source files: use the clone we're running from, otherwise download them.
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+if [[ -z "$SRC_DIR" || ! -f "$SRC_DIR/branchnew" ]]; then
+  SRC_DIR="$(mktemp -d)"
+  trap 'rm -rf "$SRC_DIR"' EXIT
+  echo "↓ downloading branchnew from GitHub…"
+  for f in branchnew commands/branchnew.md iterm2/claude_fork.py; do
+    mkdir -p "$SRC_DIR/$(dirname "$f")"
+    curl -fsSL "$REPO_RAW/$f" -o "$SRC_DIR/$f"
+  done
 fi
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 1) the branchnew command
 DEST_DIR="$HOME/.local/bin"
 DEST="$DEST_DIR/branchnew"
-
 mkdir -p "$DEST_DIR"
 install -m 0755 "$SRC_DIR/branchnew" "$DEST"
 echo "✓ installed: $DEST"
 
-# Make sure ~/.local/bin is on PATH.
 case ":$PATH:" in
-  *":$DEST_DIR:"*)
-    echo "✓ $DEST_DIR is already on PATH"
-    ;;
+  *":$DEST_DIR:"*) echo "✓ $DEST_DIR is on PATH" ;;
   *)
-    RC="$HOME/.zshrc"
-    LINE='export PATH="$HOME/.local/bin:$PATH"'
+    RC="$HOME/.zshrc"; LINE='export PATH="$HOME/.local/bin:$PATH"'
     if ! grep -qsF "$LINE" "$RC" 2>/dev/null; then
       printf '\n# added by branchnew installer\n%s\n' "$LINE" >> "$RC"
       echo "✓ added $DEST_DIR to PATH in $RC"
@@ -36,33 +51,52 @@ case ":$PATH:" in
     ;;
 esac
 
-# Friendly heads-up if the claude CLI isn't visible yet.
-if ! command -v claude >/dev/null 2>&1; then
-  echo "! note: 'claude' was not found on PATH — install Claude Code so branchnew has something to launch."
-fi
-
-# Install the /branchnew slash command (type it inside a Claude Code session to fork).
+# 2) the /branchnew slash command
 CMD_DIR="$HOME/.claude/commands"
 mkdir -p "$CMD_DIR"
 install -m 0644 "$SRC_DIR/commands/branchnew.md" "$CMD_DIR/branchnew.md"
-echo "✓ installed /branchnew slash command: $CMD_DIR/branchnew.md"
+echo "✓ installed /branchnew slash command"
 
-# ── Optional: the iTerm2 hotkey (⌃⌥⌘F) fork daemon. ───────────────────────────
-if [[ "${1:-}" == "--hotkey" ]]; then
+command -v claude >/dev/null 2>&1 || echo "! note: 'claude' is not on PATH — install Claude Code."
+
+# 3) optional: iTerm2 hotkey daemon + auto-wired hooks
+if [[ "$WANT_HOTKEY" == 1 ]]; then
   AL="$HOME/Library/Application Support/iTerm2/Scripts/AutoLaunch"
   mkdir -p "$AL"
   install -m 0644 "$SRC_DIR/iterm2/claude_fork.py" "$AL/claude_fork.py"
-  echo "✓ installed iTerm2 hotkey daemon: $AL/claude_fork.py"
+  echo "✓ installed iTerm2 hotkey daemon"
+
+  # Wire the two recorder hooks into ~/.claude/settings.json (idempotent, backed up).
+  python3 - "$DEST" <<'PY' || true
+import json, os, sys, shutil
+dest = sys.argv[1]
+p = os.path.expanduser("~/.claude/settings.json")
+os.makedirs(os.path.dirname(p), exist_ok=True)
+d = {}
+if os.path.exists(p):
+    shutil.copy(p, p + ".bak")
+    try:
+        with open(p) as f: d = json.load(f)
+    except Exception:
+        sys.exit("! ~/.claude/settings.json isn't valid JSON — add the hooks by hand (see HOTKEY-FORK.md).")
+hooks = d.setdefault("hooks", {})
+cmd = dest + " --record"
+def ensure(ev):
+    arr = hooks.setdefault(ev, [])
+    if any(h.get("command", "").strip() == cmd for blk in arr for h in blk.get("hooks", [])):
+        return False
+    arr.append({"hooks": [{"type": "command", "command": cmd}]}); return True
+changed = ensure("SessionStart") | ensure("UserPromptSubmit")
+with open(p, "w") as f: json.dump(d, f, indent=2, ensure_ascii=False)
+print("✓ wired SessionStart/UserPromptSubmit → branchnew --record" if changed else "✓ hooks already wired")
+PY
+
   echo
-  echo "To finish hotkey (⌃⌥⌘F) setup:"
+  echo "Almost there — two one-time manual bits for the hotkey:"
   echo "  1. iTerm2 → Settings → General → Magic → enable \"Enable Python API\""
-  echo "  2. Add these two hooks to ~/.claude/settings.json (one command each):"
-  echo "        SessionStart     →  $DEST --record"
-  echo "        UserPromptSubmit →  $DEST --record"
-  echo "  3. Restart iTerm2 (allow the script when prompted), start a Claude"
-  echo "     session, then press ⌃⌥⌘F in that pane."
-  echo "  See HOTKEY-FORK.md for details."
+  echo "  2. Restart iTerm2 and click \"Allow\" when it asks about claude_fork.py"
+  echo "  Then open a Claude session and press ⌃⌥⌘F.   (details: HOTKEY-FORK.md)"
 fi
 
 echo
-echo "Done. Try:  branchnew --help"
+echo "Done.  Inside Claude Code type  /branchnew  — or run  branchnew --help"

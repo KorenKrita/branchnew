@@ -55,17 +55,32 @@ branchnew 试一下别的方案    # 名字可带空格/中文,不用加引号
 
 ## 安装
 
-### 方式一:一键安装
+**一行装好**(`branchnew` 命令 + `/branchnew` 斜杠命令,无需 clone):
 
 ```bash
-git clone https://github.com/limin112/branchnew.git
-cd branchnew
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/limin112/branchnew/main/install.sh | bash
 ```
 
-`install.sh` 会把 `branchnew` 装到 `~/.local/bin/`、设好可执行权限,并在需要时把 `~/.local/bin` 加进 PATH。
+想**连 iTerm2 ⌃⌥⌘F 热键 fork 一起装**(会自动帮你写好 Claude 钩子):
 
-### 方式二:手动
+```bash
+curl -fsSL https://raw.githubusercontent.com/limin112/branchnew/main/install.sh | bash -s -- --hotkey
+```
+
+> 热键还需两步一次性手动:iTerm2 设置里开启 Python API、重启 iTerm2 并允许脚本——见 [HOTKEY-FORK.md](HOTKEY-FORK.md)。
+
+装完后:在 Claude Code 里打 **`/branchnew`**,或终端里 `branchnew --help`。`~/.local/bin` 不在 PATH 时安装脚本会自动加上(新开终端生效)。
+
+<details>
+<summary>从 clone 安装 / 只装命令本体</summary>
+
+```bash
+git clone https://github.com/limin112/branchnew.git && cd branchnew
+./install.sh            # 基础:branchnew + /branchnew
+./install.sh --hotkey   # 再加 iTerm2 热键守护 + 自动写钩子
+```
+
+只要 `branchnew` 命令本体(手动):
 
 ```bash
 mkdir -p ~/.local/bin
@@ -73,8 +88,7 @@ curl -fsSL https://raw.githubusercontent.com/limin112/branchnew/main/branchnew -
 chmod +x ~/.local/bin/branchnew
 grep -q '.local/bin' ~/.zshrc || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 ```
-
-开一个新终端后即可使用。
+</details>
 
 ## 会话命名与编号
 

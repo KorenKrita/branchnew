@@ -150,17 +150,18 @@ HOTKEY_MODS = {iterm2.Modifier.CONTROL, iterm2.Modifier.OPTION, iterm2.Modifier.
 
 ## 从零复现 / 装到另一台机器
 
+一行(无需 clone):
+
 ```bash
-git clone https://github.com/limin112/branchnew.git
-cd branchnew
-./install.sh --hotkey      # 装 branchnew + 把 claude_fork.py 放进 iTerm2 AutoLaunch
+curl -fsSL https://raw.githubusercontent.com/limin112/branchnew/main/install.sh | bash -s -- --hotkey
 ```
 
-`--hotkey` 会复制守护脚本并打印剩余手动步骤;按提示:
+`--hotkey` 会:装好 `branchnew` + `/branchnew`、把 `claude_fork.py` 放进 iTerm2 AutoLaunch、**并自动把两条 `branchnew --record` 钩子写进 `~/.claude/settings.json`**(已存在则跳过,原文件备份为 `.bak`)。剩下两步一次性手动:
 
 1. **开启 iTerm2 Python API**:Settings → General → Magic → Enable Python API。
-2. **加钩子**:在 `~/.claude/settings.json` 的 `hooks` 里,给 `SessionStart` 和 `UserPromptSubmit` 各加一条 `command` = `~/.local/bin/branchnew --record`(见上面 JSON)。
-3. **重启 iTerm2**,开一个 Claude 会话(触发 `SessionStart` 写映射),然后在该窗格按 **⌃⌥⌘F**。
+2. **重启 iTerm2**(首次弹窗点「允许」),开一个 Claude 会话触发 `SessionStart` 写映射,然后在该窗格按 **⌃⌥⌘F**。
+
+> 从 clone 装也行:`git clone … && cd branchnew && ./install.sh --hotkey`。
 
 ---
 
