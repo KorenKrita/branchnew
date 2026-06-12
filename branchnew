@@ -8,37 +8,32 @@
 # Usage:
 #   branchnew            split right + fork, auto-named newBranch1, newBranch2, …
 #   branchnew <name>     split right + fork, named <name> (verbatim, no number)
+#   branchnew --down     split down instead of right (combinable with <name>)
 #   branchnew --help     show help
-#   branchnew --record   (internal) record this pane's iTerm-guid ↔ session map for
-#                        the hotkey fork daemon; called by Claude hooks, not by you.
+#   branchnew --record   (internal) record pane ↔ session mapping for the hotkey
+#                        fork daemons; called by Claude hooks, not by you.
 #
 # Backend is auto-detected: tmux (real split) > iTerm2 (native split) >
-# Apple Terminal (can't split → new window) > anything else (new Terminal window).
+# Ghostty (AppleScript split) > Apple Terminal (can't split → new window) >
+# anything else (new Terminal window).
 #
 # The fork's name is set with `claude --name`, shown in the new session's prompt
 # box, /resume picker, and terminal title. The auto counter is stored in
 # ${XDG_STATE_HOME:-~/.local/state}/branchnew/counter.
 #
-# Run it from the directory your Claude session is in: it forks the most recent
-# session in $PWD.
+# When run inside a Claude session ($CLAUDE_CODE_SESSION_ID set), it forks THAT
+# exact session. Otherwise it forks the most recent session in $PWD.
 
 emulate -L zsh
 
-# ── Internal: `branchnew --record` (merged from the former standalone
-# branchnew-record). Called by Claude SessionStart / UserPromptSubmit hooks to
-# remember which Claude session lives in which iTerm pane, so the iTerm hotkey
-# daemon (iterm2/claude_fork.py) can fork the exact session in a pane. Not for
-# interactive use — see HOTKEY-FORK.md. Writes two lines (session id, cwd) to
-# ${XDG_STATE_HOME:-~/.local/state}/branchnew/iterm/<iterm-guid>.
+# ── Internal: `branchnew --record` — called by Claude hooks (SessionStart /
+# UserPromptSubmit) to remember which Claude session lives in which terminal
+# pane. Used by the hotkey fork daemons (iTerm2: iterm2/claude_fork.py, Ghostty:
+# ghostty/fork.sh) to fork the exact session. Not for interactive use.
+# Writes mapping to iterm/<guid> and/or ghostty/<tty>.
 if [[ "${1:-}" == "--record" ]]; then
   state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
-  dir="$state/iterm"
-  mkdir -p "$dir" 2>/dev/null
-
-  # iTerm pane GUID = the part after ':' in $ITERM_SESSION_ID; it equals what the
-  # iTerm2 Python API reports as session.session_id.
-  src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
-  guid="${src##*:}"
+  mkdir -p "$state/iterm" "$state/ghostty" 2>/dev/null
 
   # Hook JSON (session_id / cwd / hook_event_name / transcript_path) on stdin.
   json_sid="" cwd="" event="" tpath=""
@@ -67,24 +62,44 @@ except Exception:
   sid="${tid:-${CLAUDE_CODE_SESSION_ID:-$json_sid}}"
   [[ -n "$cwd" ]] || cwd="${PWD:-}"
 
-  print -r -- "$(date '+%F %T') event=${event:-?} json_sid=${json_sid:-NONE} tid=${tid:-NONE} env_sid=${CLAUDE_CODE_SESSION_ID:-NONE} guid=${guid:-NONE}" >> "$state/record.log" 2>/dev/null
+  # ── iTerm2: pane GUID from $ITERM_SESSION_ID ──
+  src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
+  guid="${src##*:}"
+  if [[ -n "$guid" && -n "$sid" ]]; then
+    { print -r -- "$sid"; print -r -- "$cwd"; } > "$state/iterm/$guid"
+  fi
 
-  [[ -n "$guid" && -n "$sid" ]] || exit 0
-  { print -r -- "$sid"; print -r -- "$cwd"; } > "$dir/$guid"
+  # ── Ghostty: TTY as pane identifier (from parent claude process) ──
+  gtty=""
+  if [[ "${TERM_PROGRAM:-}" == "ghostty" && -n "$sid" ]]; then
+    gtty="$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')"
+    [[ -z "$gtty" || "$gtty" == "??" ]] && gtty="$(ps -o tty= -p $(ps -o ppid= -p $PPID 2>/dev/null | tr -d ' ') 2>/dev/null | tr -d ' ')"
+    if [[ -n "$gtty" && "$gtty" != "??" ]]; then
+      { print -r -- "$sid"; print -r -- "$cwd"; } > "$state/ghostty/$gtty"
+    fi
+  fi
+
+  print -r -- "$(date '+%F %T') event=${event:-?} sid=${sid:-NONE} guid=${guid:-NONE} tty=${gtty:-NONE}" >> "$state/record.log" 2>/dev/null
   exit 0
 fi
 
-# ── Args: --help → help; one-or-more args → that name; no args → auto name. ────
+# ── Args: --help → help; --down → split down; rest → name. ────
+split_down=0
 case "${1:-}" in
   -h|--help|help)
     print -r -- "Usage:"
     print -r -- "  branchnew            split right + fork the current Claude session,"
     print -r -- "                       auto-named newBranch1, newBranch2, … (a counter)"
     print -r -- "  branchnew <name>     same, but name the new session <name>"
+    print -r -- "  branchnew --down     split down instead of right"
     print -r -- "  branchnew --help     show this help"
     print -r -- ""
-    print -r -- "Backend auto-detected: tmux > iTerm2 > Apple Terminal > new Terminal window."
+    print -r -- "Backend auto-detected: tmux > iTerm2 > Ghostty > Apple Terminal > new Terminal window."
     exit 0
+    ;;
+  --down)
+    split_down=1
+    shift
     ;;
 esac
 
@@ -105,34 +120,72 @@ fi
 
 print -u2 -r -- "branchnew: new branch session → ${name}"
 
-# Command the new pane will run. ${(q)...} keeps paths / names with spaces safe;
-# the new shell sees one --name argument even if the name contains spaces.
-cmd="cd ${(q)PWD} && claude --continue --fork-session --name ${(q)name}"
+# When running inside a Claude session, use --resume <id> to fork THIS EXACT
+# session (not just the most recent in $PWD). Falls back to --continue otherwise.
+if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+  resume_flag="--resume ${(q)CLAUDE_CODE_SESSION_ID}"
+else
+  resume_flag="--continue"
+fi
+cmd="cd ${(q)PWD} && claude ${resume_flag} --fork-session --name ${(q)name}"
 
 # Debug aid: BRANCHNEW_DRYRUN=1 prints what would run and opens nothing.
 if [[ -n "${BRANCHNEW_DRYRUN:-}" ]]; then
-  print -r -- "[dry-run] TMUX=${TMUX:+set} TERM_PROGRAM=${TERM_PROGRAM:-unknown}"
+  local direction="right"; (( split_down )) && direction="down"
+  print -r -- "[dry-run] TMUX=${TMUX:+set} TERM_PROGRAM=${TERM_PROGRAM:-unknown} direction=$direction"
   print -r -- "[dry-run] command: $cmd"
   exit 0
 fi
 
 # ── Backends — always a split to the right, or the closest each one can do. ────
 launch_tmux() {
-  tmux split-window -h -c "$PWD" || return 1
-  tmux send-keys "claude --continue --fork-session --name ${(q)name}" Enter
+  local flag="-h"
+  (( split_down )) && flag="-v"
+  tmux split-window "$flag" -c "$PWD" || return 1
+  tmux send-keys "claude ${resume_flag} --fork-session --name ${(q)name}" Enter
 }
 
 launch_iterm() {
+  local dir="vertical"
+  (( split_down )) && dir="horizontal"
   osascript \
     -e 'on run argv' \
     -e 'set cmd to item 1 of argv' \
+    -e 'set dir to item 2 of argv' \
     -e 'tell application "iTerm"' \
     -e '  activate' \
-    -e '  tell current session of current window to set s to (split vertically with default profile)' \
+    -e '  tell current session of current window' \
+    -e '    if dir is "horizontal" then' \
+    -e '      set s to (split horizontally with default profile)' \
+    -e '    else' \
+    -e '      set s to (split vertically with default profile)' \
+    -e '    end if' \
+    -e '  end tell' \
     -e '  tell s to write text cmd' \
     -e 'end tell' \
     -e 'end run' \
-    "$cmd" 2>&1 >/dev/null
+    "$cmd" "$dir" 2>&1 >/dev/null
+}
+
+launch_ghostty() {
+  local dir="right"
+  (( split_down )) && dir="down"
+  osascript \
+    -e 'on run argv' \
+    -e 'set cmd to (item 1 of argv) & linefeed' \
+    -e 'set dir to item 2 of argv' \
+    -e 'tell application "Ghostty"' \
+    -e '  set currentTerm to focused terminal of selected tab of front window' \
+    -e '  if dir is "down" then' \
+    -e '    set newTerm to split currentTerm direction down' \
+    -e '  else' \
+    -e '    set newTerm to split currentTerm direction right' \
+    -e '  end if' \
+    -e '  delay 0.3' \
+    -e '  input text cmd to newTerm' \
+    -e 'end tell' \
+    -e 'end run' \
+    "$cmd" "$dir" 2>&1 >/dev/null
 }
 
 launch_terminal_window() {
@@ -164,6 +217,9 @@ fi
 case "${TERM_PROGRAM:-}" in
   iTerm.app)
     if ! err="$(launch_iterm)"; then fail "$err"; fi
+    ;;
+  ghostty)
+    if ! err="$(launch_ghostty)"; then fail "$err"; fi
     ;;
   Apple_Terminal)
     print -u2 -r -- "branchnew: Apple Terminal can't split panes — opening a new window instead."

@@ -2,9 +2,8 @@
 """
 claude_fork.py — iTerm2 AutoLaunch daemon.
 
-Press the hotkey (default: Command+F) in any iTerm pane that is
-running a Claude Code session, and it splits the pane to the right and forks
-*that exact* session there:  claude --resume <id> --fork-session
+Press Command+F to split RIGHT and fork the current Claude session.
+Press Command+Shift+F to split DOWN and fork the current Claude session.
 
 The pane -> session mapping is written by `branchnew --record` (run from the
 Claude SessionStart / UserPromptSubmit hooks) under
@@ -21,9 +20,10 @@ import iterm2
 STATE_DIR = os.path.expanduser("~/.local/state/branchnew/iterm")
 LOG = os.path.expanduser("~/.local/state/branchnew/iterm-fork.log")
 
-# ---- Hotkey: edit these two lines to rebind ---------------------------------
+# ---- Hotkeys: edit these to rebind ------------------------------------------
 HOTKEY_KEYCODE = iterm2.Keycode.ANSI_F
-HOTKEY_MODS = {iterm2.Modifier.COMMAND}
+HOTKEY_RIGHT_MODS = {iterm2.Modifier.COMMAND}
+HOTKEY_DOWN_MODS = {iterm2.Modifier.COMMAND, iterm2.Modifier.SHIFT}
 # -----------------------------------------------------------------------------
 
 
@@ -33,7 +33,8 @@ def _v(x):
 
 
 _HK = _v(HOTKEY_KEYCODE)
-_HM = {_v(m) for m in HOTKEY_MODS}
+_HM_RIGHT = {_v(m) for m in HOTKEY_RIGHT_MODS}
+_HM_DOWN = {_v(m) for m in HOTKEY_DOWN_MODS}
 
 
 def log(msg):
@@ -56,7 +57,7 @@ def lookup(guid):
     return (sid or None), (cwd or None)
 
 
-async def do_fork(app):
+async def do_fork(app, vertical=True):
     window = app.current_terminal_window
     tab = window.current_tab if window else None
     session = tab.current_session if tab else None
@@ -68,40 +69,42 @@ async def do_fork(app):
     if not sid:
         log("no mapping for pane guid=%s — open/record a Claude session there first" % guid)
         return
-    # Fork the session that's actually live in this pane. The pane->id map is kept
-    # current by the UserPromptSubmit hook, so a forked pane resolves to the FORK's
-    # own id (which only comes into existence once the fork first branches) — that's
-    # what lets a fork-of-a-fork fork the fork instead of the original.
-    log("fork: pane=%s -> session=%s cwd=%s" % (guid, sid, cwd))
-    new_session = await session.async_split_pane(vertical=True)
+    direction = "right" if vertical else "down"
+    log("fork (%s): pane=%s -> session=%s cwd=%s" % (direction, guid, sid, cwd))
+    new_session = await session.async_split_pane(vertical=vertical)
     cmd = "claude --resume %s --fork-session -n fork" % shlex.quote(sid)
     if cwd:
         cmd = "cd %s && %s" % (shlex.quote(cwd), cmd)
-    await asyncio.sleep(0.35)  # let the new pane's shell come up
+    await asyncio.sleep(0.35)
     await new_session.async_send_text(cmd + "\n")
 
 
 async def main(connection):
     app = await iterm2.async_get_app(connection)
 
-    pattern = iterm2.KeystrokePattern()
-    pattern.keycodes = [HOTKEY_KEYCODE]
-    pattern.required_modifiers = list(HOTKEY_MODS)
+    pattern_right = iterm2.KeystrokePattern()
+    pattern_right.keycodes = [HOTKEY_KEYCODE]
+    pattern_right.required_modifiers = list(HOTKEY_RIGHT_MODS)
 
-    log("daemon started (hotkey keycode=%s mods=%s)" % (_HK, sorted(_HM)))
+    pattern_down = iterm2.KeystrokePattern()
+    pattern_down.keycodes = [HOTKEY_KEYCODE]
+    pattern_down.required_modifiers = list(HOTKEY_DOWN_MODS)
 
-    # KeystrokeFilter swallows our chord so it never reaches the shell;
-    # KeystrokeMonitor notifies us when it (and everything else) is pressed.
-    async with iterm2.KeystrokeFilter(connection, [pattern]):
+    log("daemon started (right=%s+%s, down=%s+%s)" % (
+        _HK, sorted(_HM_RIGHT), _HK, sorted(_HM_DOWN)))
+
+    async with iterm2.KeystrokeFilter(connection, [pattern_right, pattern_down]):
         async with iterm2.KeystrokeMonitor(connection) as mon:
             while True:
                 ks = await mon.async_get()
                 if _v(ks.keycode) != _HK:
                     continue
-                if not _HM.issubset({_v(m) for m in ks.modifiers}):
-                    continue
+                mods = {_v(m) for m in ks.modifiers}
                 try:
-                    await do_fork(app)
+                    if _HM_DOWN.issubset(mods):
+                        await do_fork(app, vertical=False)
+                    elif _HM_RIGHT.issubset(mods):
+                        await do_fork(app, vertical=True)
                 except Exception as e:
                     log("fork error: %r" % e)
 

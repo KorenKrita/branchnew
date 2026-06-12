@@ -26,7 +26,7 @@ if [[ -z "$SRC_DIR" || ! -f "$SRC_DIR/branchnew" ]]; then
   SRC_DIR="$(mktemp -d)"
   trap 'rm -rf "$SRC_DIR"' EXIT
   echo "↓ downloading branchnew from GitHub…"
-  for f in branchnew commands/branchnew.md iterm2/claude_fork.py; do
+  for f in branchnew commands/branchnew.md iterm2/claude_fork.py ghostty/fork.sh; do
     mkdir -p "$SRC_DIR/$(dirname "$f")"
     curl -fsSL "$REPO_RAW/$f" -o "$SRC_DIR/$f"
   done
@@ -59,12 +59,21 @@ echo "✓ installed /branchnew slash command"
 
 command -v claude >/dev/null 2>&1 || echo "! note: 'claude' is not on PATH — install Claude Code."
 
-# 3) optional: iTerm2 hotkey daemon + auto-wired hooks
+# 3) optional: hotkey daemon + auto-wired hooks
 if [[ "$WANT_HOTKEY" == 1 ]]; then
-  AL="$HOME/Library/Application Support/iTerm2/Scripts/AutoLaunch"
-  mkdir -p "$AL"
-  install -m 0644 "$SRC_DIR/iterm2/claude_fork.py" "$AL/claude_fork.py"
-  echo "✓ installed iTerm2 hotkey daemon"
+  # iTerm2: install the Python API hotkey daemon
+  if [[ "${TERM_PROGRAM:-}" == "iTerm.app" || -d "/Applications/iTerm.app" ]]; then
+    AL="$HOME/Library/Application Support/iTerm2/Scripts/AutoLaunch"
+    mkdir -p "$AL"
+    install -m 0644 "$SRC_DIR/iterm2/claude_fork.py" "$AL/claude_fork.py"
+    echo "✓ installed iTerm2 hotkey daemon"
+  fi
+
+  # Ghostty: install the fork script
+  if [[ "${TERM_PROGRAM:-}" == "ghostty" || -d "/Applications/Ghostty.app" ]]; then
+    install -m 0755 "$SRC_DIR/ghostty/fork.sh" "$DEST_DIR/ghostty-fork"
+    echo "✓ installed ghostty-fork script"
+  fi
 
   # Wire the two recorder hooks into ~/.claude/settings.json (idempotent, backed up).
   python3 - "$DEST" <<'PY' || true
@@ -92,10 +101,21 @@ print("✓ wired SessionStart/UserPromptSubmit → branchnew --record" if change
 PY
 
   echo
-  echo "Almost there — two one-time manual bits for the hotkey:"
-  echo "  1. iTerm2 → Settings → General → Magic → enable \"Enable Python API\""
-  echo "  2. Restart iTerm2 and click \"Allow\" when it asks about claude_fork.py"
-  echo "  Then open a Claude session and press ⌘F.   (details: HOTKEY-FORK.md)"
+  if [[ "${TERM_PROGRAM:-}" == "iTerm.app" || -d "/Applications/iTerm.app" ]]; then
+    echo "iTerm2 hotkey (⌘F):"
+    echo "  1. iTerm2 → Settings → General → Magic → enable \"Enable Python API\""
+    echo "  2. Restart iTerm2 and click \"Allow\" when it asks about claude_fork.py"
+    echo "  Then open a Claude session and press ⌘F.   (details: HOTKEY-FORK.md)"
+    echo
+  fi
+  if [[ "${TERM_PROGRAM:-}" == "ghostty" || -d "/Applications/Ghostty.app" ]]; then
+    echo "Ghostty hotkey:"
+    echo "  Bind 'ghostty-fork' to a keyboard shortcut via macOS Shortcuts,"
+    echo "  Raycast, or Hammerspoon. Example Hammerspoon config:"
+    echo "    hs.hotkey.bind({\"cmd\"}, \"f\", function() hs.execute(\"ghostty-fork\") end)"
+    echo "  The script uses Ghostty's AppleScript API to split right and fork."
+    echo
+  fi
 fi
 
 echo
