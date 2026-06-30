@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# branchnew-hotkey — tmux layer hotkey fork (the reliable path).
+#
+# Bound to a tmux key (e.g. `bind-key F run-shell 'branchnew-hotkey'`).
+# Runs in the tmux SERVER process (no tty of its own), so it uses tmux's own
+# format queries to get the active pane's tty + cwd, looks up the session
+# mapping, and splits a new pane running the fork command.
+#
+# This is the Windows-Terminal/WSL equivalent of iTerm2's claude_fork.py:
+# an external process that queries a mapping table and splits, WITHOUT
+# touching any pane's input stream — so it works reliably for both OMP and
+# Claude TUIs (unlike WT's sendInput, which a running TUI would swallow).
+#
+# Session lookup (by active pane tty, e.g. pts/3 -> pts-3):
+#   OMP:     ~/.omp/agent/terminal-sessions/pts-3  (line 2 = jsonl path)
+#   Claude:  ~/.local/state/branchnew/claude/pts-3 (line 1 = claude session id)
+#
+# Usage:
+#   branchnew-hotkey            split right + fork (auto-named newBranch<N>)
+#   branchnew-hotkey <name>     split right + fork, named <name>
+#   branchnew-hotkey --down     split down (combinable with <name>)
+#
+# Env: BRANCHNEW_OMP_DELAY (default 2) — seconds before /rename is sent to OMP.
+
+set -u
+
+state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
+OMP_SESSIONS="$HOME/.omp/agent/terminal-sessions"
+OMP_DELAY="${BRANCHNEW_OMP_DELAY:-2}"
+
+# ── Args ──
+split_down=0
+case "${1:-}" in
+  --down) split_down=1; shift ;;
+esac
+if (( $# > 0 )); then
+  name="$*"
+else
+  mkdir -p "$state" 2>/dev/null
+  counter_file="$state/counter"
+  cur="$(cat "$counter_file" 2>/dev/null)"
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  n=$(( cur + 1 ))
+  printf '%s\n' "$n" > "$counter_file" 2>/dev/null
+  name="newBranch${n}"
+fi
+
+# ── Get active pane context from tmux (we have no tty ourselves) ──
+pane_tty="$(tmux display-message -p '#{pane_tty}' 2>/dev/null)"
+pane_cwd="$(tmux display-message -p '#{pane_current_path}' 2>/dev/null)"
+
+if [[ -z "$pane_tty" ]]; then
+  tmux display-message "branchnew-hotkey: no active pane tty (not in tmux?)" 2>/dev/null
+  printf '%s\n' "branchnew-hotkey: no active pane tty — must be run via tmux bind-key" >&2
+  exit 1
+fi
+
+# /dev/pts/3 -> pts-3
+tty_key="${pane_tty#/dev/}"
+tty_key="${tty_key//\//-}"
+
+# ── Look up session mapping ──
+session_backend=""
+omp_src=""
+claude_sid=""
+
+# 1) OMP
+if [[ -f "$OMP_SESSIONS/$tty_key" ]]; then
+  omp_src="$(sed -n '2p' "$OMP_SESSIONS/$tty_key" 2>/dev/null)"
+  if [[ -n "$omp_src" && -f "$omp_src" ]]; then
+    session_backend="omp"
+  fi
+fi
+
+# 2) Claude
+if [[ -z "$session_backend" ]]; then
+  if [[ -f "$state/claude/$tty_key" ]]; then
+    claude_sid="$(sed -n '1p' "$state/claude/$tty_key" 2>/dev/null)"
+    [[ -n "$claude_sid" ]] && session_backend="claude"
+  fi
+  # Live env (Claude sets CLAUDE_CODE_SESSION_ID; but run-shell won't inherit
+  # the pane's env — only tmux's. The mapping file written by --record is the
+  # reliable path; CLAUDE_CODE_SESSION_ID is a last resort.)
+  if [[ -z "$session_backend" && -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+    claude_sid="$CLAUDE_CODE_SESSION_ID"
+    session_backend="claude"
+  fi
+fi
+
+if [[ -z "$session_backend" ]]; then
+  msg="branchnew: no session on tty $tty_key"
+  tmux display-message "$msg" 2>/dev/null
+  printf '%s\n' "$msg" >&2
+  exit 1
+fi
+
+# ── Build fork command ──
+q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+cwd="${pane_cwd:-$PWD}"
+
+if [[ "$session_backend" == "omp" ]]; then
+  fork_cmd="cd $(q "$cwd") && omp --fork $(q "$omp_src")"
+  rename_cmd="/rename $(q "$name")"
+else
+  fork_cmd="cd $(q "$cwd") && claude --resume $(q "$claude_sid") --fork-session --name $(q "$name")"
+  rename_cmd=""
+fi
+
+# Debug aid: BRANCHNEW_DRYRUN=1 prints what would run and splits nothing.
+if [[ -n "${BRANCHNEW_DRYRUN:-}" ]]; then
+  direction="right"; (( split_down )) && direction="down"
+  printf '%s\n' "[dry-run] pane_tty=$pane_tty tty_key=$tty_key backend=$session_backend direction=$direction"
+  printf '%s\n' "[dry-run] cwd=$cwd"
+  printf '%s\n' "[dry-run] fork:    $fork_cmd"
+  [[ -n "$rename_cmd" ]] && printf '%s\n' "[dry-run] rename:  $rename_cmd (after ${OMP_DELAY}s)"
+  exit 0
+fi
+
+# ── Split and run ──
+flag="-h"
+(( split_down )) && flag="-v"
+
+# split-window -P -F prints the new pane's id; target it explicitly for all
+# subsequent send-keys (avoids fragile {right}/{down} layout-relative targets,
+# which break after focus changes or in complex layouts).
+new_pane="$(tmux split-window "$flag" -c "$cwd" -P -F '#{pane_id}' 2>/dev/null)" || {
+  tmux display-message "branchnew: tmux split-window failed" 2>/dev/null
+  exit 1
+}
+tmux send-keys -t "$new_pane" "$fork_cmd" Enter
+
+# OMP: schedule /rename after the TUI starts up.
+if [[ -n "$rename_cmd" ]]; then
+  ( sleep "$OMP_DELAY" && tmux send-keys -t "$new_pane" "$rename_cmd" Enter ) &
+fi
+
+tmux display-message "branchnew: forked → ${name}" 2>/dev/null

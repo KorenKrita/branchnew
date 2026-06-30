@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 #
 # branchnew — split the current terminal to the right and continue the current
 # session there as an independent FORK. Supports both Claude Code and OMP.
@@ -12,8 +12,8 @@
 #                        fork daemons; called by Claude hooks, not by you.
 #
 # Backend is auto-detected: tmux (real split) > iTerm2 (native split) >
-# Ghostty (AppleScript split) > Apple Terminal (can't split → new window) >
-# anything else (new Terminal window).
+# Ghostty (AppleScript split) > Windows Terminal (wt.exe split-pane) >
+# Apple Terminal (can't split → new window) > anything else (new Terminal window).
 #
 # Session backend auto-detected: OMP (via ~/.omp/agent/terminal-sessions/<tty>)
 # > Claude Code (via $CLAUDE_CODE_SESSION_ID or branchnew mapping) > fallback.
@@ -26,25 +26,50 @@
 # OMP fork needs ~1.5-2s TUI startup before /rename can be accepted; the delay is
 # BRANCHNEW_OMP_DELAY (default 2).
 
-emulate -L zsh
+set -u
 
 state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
 OMP_SESSIONS="$HOME/.omp/agent/terminal-sessions"
 OMP_DELAY="${BRANCHNEW_OMP_DELAY:-2}"
+
+# ── Detect the controlling tty (macOS: ttys000, Linux/WSL: pts/3) ──
+# `tty` fails with "not a tty" when there's no controlling tty — e.g. inside a
+# hook subprocess or an OMP /command. Walk UP the process tree until we find a
+# process whose tty is a real pty. Returns the tty WITHOUT /dev/ prefix
+# (e.g. "pts/3" or "ttys000"), or empty if none found.
+detect_tty() {
+  local t wpid
+  t="$(tty 2>/dev/null)"
+  if [[ "$t" == /dev/ttys* || "$t" == /dev/pts/* ]]; then
+    printf '%s' "${t#/dev/}"
+    return 0
+  fi
+  wpid=$$
+  for _ in 1 2 3 4 5 6 7 8; do
+    [[ -z "$wpid" || "$wpid" == "1" ]] && break
+    t="$(ps -o tty= -p "$wpid" 2>/dev/null | tr -d ' ')"
+    if [[ "$t" == ttys* || "$t" == pts/* ]]; then
+      printf '%s' "$t"
+      return 0
+    fi
+    wpid="$(ps -o ppid= -p "$wpid" 2>/dev/null | tr -d ' ')"
+  done
+  return 1
+}
 
 # ── Internal: `branchnew --record` — called by Claude hooks (SessionStart /
 # UserPromptSubmit) to remember which Claude session lives in which terminal
 # pane. Used by the hotkey fork daemons. Not for interactive use.
 # (OMP maintains its own terminal-sessions/<tty> mapping; this is Claude-only.)
 if [[ "${1:-}" == "--record" ]]; then
-  mkdir -p "$state/iterm" "$state/ghostty" 2>/dev/null
+  mkdir -p "$state/iterm" "$state/ghostty" "$state/claude" 2>/dev/null
 
   json_sid="" cwd="" event="" tpath=""
   if [[ ! -t 0 ]]; then
     json="$(cat 2>/dev/null)"
     if [[ -n "$json" ]]; then
-      PY="$(command -v python3 || print -- /usr/bin/python3)"
-      parsed="$(print -r -- "$json" | "$PY" -c 'import sys, json
+      PY="$(command -v python3 || printf '/usr/bin/python3')"
+      parsed="$(printf '%s' "$json" | "$PY" -c 'import sys, json
 try:
     d = json.load(sys.stdin)
     print(d.get("session_id", ""))
@@ -53,20 +78,27 @@ try:
     print(d.get("transcript_path", ""))
 except Exception:
     print(); print(); print(); print()' 2>/dev/null)"
-      lines=("${(@f)parsed}")
-      json_sid="${lines[1]:-}"; cwd="${lines[2]:-}"; event="${lines[3]:-}"; tpath="${lines[4]:-}"
+      # Read 4 lines into variables
+      json_sid="$(printf '%s\n' "$parsed" | sed -n '1p')"
+      cwd="$(printf '%s\n' "$parsed" | sed -n '2p')"
+      event="$(printf '%s\n' "$parsed" | sed -n '3p')"
+      tpath="$(printf '%s\n' "$parsed" | sed -n '4p')"
     fi
   fi
 
+  # transcript basename without extension (zsh :t:r equivalent)
   tid=""
-  [[ -n "$tpath" ]] && tid="${tpath:t:r}"
+  if [[ -n "$tpath" ]]; then
+    _base="${tpath##*/}"          # basename
+    tid="${_base%.*}"             # strip extension
+  fi
   sid="${tid:-${CLAUDE_CODE_SESSION_ID:-$json_sid}}"
   [[ -n "$cwd" ]] || cwd="${PWD:-}"
 
   src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
   guid="${src##*:}"
   if [[ -n "$guid" && -n "$sid" ]]; then
-    { print -r -- "$sid"; print -r -- "$cwd"; } > "$state/iterm/$guid"
+    { printf '%s\n' "$sid"; printf '%s\n' "$cwd"; } > "$state/iterm/$guid"
   fi
 
   gtty=""
@@ -74,11 +106,24 @@ except Exception:
     gtty="$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')"
     [[ -z "$gtty" || "$gtty" == "??" ]] && gtty="$(ps -o tty= -p $(ps -o ppid= -p $PPID 2>/dev/null | tr -d ' ') 2>/dev/null | tr -d ' ')"
     if [[ -n "$gtty" && "$gtty" != "??" ]]; then
-      { print -r -- "$sid"; print -r -- "$cwd"; } > "$state/ghostty/$gtty"
+      { printf '%s\n' "$sid"; printf '%s\n' "$cwd"; } > "$state/ghostty/$gtty"
     fi
   fi
 
-  print -r -- "$(date '+%F %T') event=${event:-?} sid=${sid:-NONE} guid=${guid:-NONE} tty=${gtty:-NONE}" >> "$state/record.log" 2>/dev/null
+  # WSL/Windows Terminal: record claude mapping keyed by tty (pts-N)
+  # so tmux hotkey (branchnew-hotkey) can look it up via pane_tty.
+  # Record claude mapping keyed by tty (pts-N), so the tmux-layer hotkey
+  # (branchnew-hotkey) can look it up via tmux's pane_tty. Use detect_tty()
+  # because hook subprocesses often have no controlling tty of their own.
+  if [[ -n "$sid" ]]; then
+    _rec_tty="$(detect_tty)"
+    if [[ -n "$_rec_tty" ]]; then
+      _rec_key="${_rec_tty//\//-}"   # pts/3 -> pts-3 ; ttys000 -> ttys000
+      { printf '%s\n' "$sid"; printf '%s\n' "$cwd"; } > "$state/claude/$_rec_key"
+    fi
+  fi
+
+  printf '%s\n' "$(date '+%F %T') event=${event:-?} sid=${sid:-NONE} guid=${guid:-NONE} tty=${gtty:-NONE}" >> "$state/record.log" 2>/dev/null
   exit 0
 fi
 
@@ -86,16 +131,16 @@ fi
 split_down=0
 case "${1:-}" in
   -h|--help|help)
-    print -r -- "Usage:"
-    print -r -- "  branchnew            split right + fork the current session,"
-    print -r -- "                       auto-named newBranch1, newBranch2, … (a counter)"
-    print -r -- "  branchnew <name>     same, but name the new session <name>"
-    print -r -- "  branchnew --down     split down instead of right"
-    print -r -- "  branchnew --help     show this help"
-    print -r -- ""
-    print -r -- "Backend auto-detected: tmux > iTerm2 > Ghostty > Apple Terminal > new Terminal window."
-    print -r -- "Session: OMP (~/.omp/agent/terminal-sessions) > Claude Code (\$CLAUDE_CODE_SESSION_ID)."
-    print -r -- "  OMP fork names via terminal-injected /rename (delay \${BRANCHNEW_OMP_DELAY:-2}s)."
+    printf '%s\n' "Usage:"
+    printf '%s\n' "  branchnew            split right + fork the current session,"
+    printf '%s\n' "                       auto-named newBranch1, newBranch2, … (a counter)"
+    printf '%s\n' "  branchnew <name>     same, but name the new session <name>"
+    printf '%s\n' "  branchnew --down     split down instead of right"
+    printf '%s\n' "  branchnew --help     show this help"
+    printf '%s\n' ""
+    printf '%s\n' "Backend auto-detected: tmux > iTerm2 > Ghostty > Windows Terminal > Apple Terminal > new window."
+    printf '%s\n' "Session: OMP (~/.omp/agent/terminal-sessions) > Claude Code (\$CLAUDE_CODE_SESSION_ID)."
+    printf '%s\n' "  OMP fork names via terminal-injected /rename (delay \${BRANCHNEW_OMP_DELAY:-2}s)."
     exit 0
     ;;
   --down)
@@ -110,47 +155,58 @@ else
   mkdir -p "$state" 2>/dev/null
   counter_file="$state/counter"
   cur="$(cat "$counter_file" 2>/dev/null)"
-  [[ "$cur" == <-> ]] || cur=0
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
   n=$(( cur + 1 ))
-  print -r -- "$n" > "$counter_file" 2>/dev/null
+  printf '%s\n' "$n" > "$counter_file" 2>/dev/null
   name="newBranch${n}"
 fi
 
-print -u2 -r -- "branchnew: new branch session → ${name}"
+printf '%s\n' "branchnew: new branch session → ${name}" >&2
 
-# ── Detect session backend: OMP vs Claude Code ───────────────────────────────
-# Get current tty (for OMP mapping lookup). `tty` returns "not a tty" (with
-# spaces) and exits non-zero when there's no controlling tty — e.g. when run
-# from inside an OMP /command (the bash tool subprocess has no tty). Walk UP
-# the process tree until we find a process whose tty starts with "ttys".
-cur_tty=""
-cur_tty="$(tty 2>/dev/null)"
-if [[ "$cur_tty" == *ttys* ]]; then
-  cur_tty="${cur_tty##*/}"
-else
-  cur_tty=""
-  _walk_pid=$$
-  for _ in {1..8}; do
-    [[ -z "$_walk_pid" || "$_walk_pid" == "1" ]] && break
-    _t="$(ps -o tty= -p "$_walk_pid" 2>/dev/null | tr -d ' ')"
-    if [[ "$_t" == ttys* ]]; then
-      cur_tty="$_t"
-      break
-    fi
-    _walk_pid="$(ps -o ppid= -p "$_walk_pid" 2>/dev/null | tr -d ' ')"
-  done
-  unset _walk_pid _t
-fi
+# ── Detect current tty (for OMP/Claude mapping lookup) ──
+# detect_tty walks the process tree when there's no controlling tty (e.g.
+# inside an OMP /command). Returns "pts/3" or "ttys000" (no /dev/ prefix).
+cur_tty="$(detect_tty)"
 
 session_backend=""
 omp_src=""
 claude_sid=""
 
-# 1) OMP: ~/.omp/agent/terminal-sessions/<tty> — line 2 is the jsonl path
-if [[ -n "$cur_tty" && -f "$OMP_SESSIONS/$cur_tty" ]]; then
-  omp_src="$(sed -n '2p' "$OMP_SESSIONS/$cur_tty" 2>/dev/null)"
-  if [[ -n "$omp_src" && -f "$omp_src" ]]; then
-    session_backend="omp"
+# 1) OMP: ~/.omp/agent/terminal-sessions/<tty> — line 2 is the jsonl path.
+# Lookup order: tmux panes use their own tty (inherited WT_SESSION points at
+# the outer WT pane and would fork the wrong session); a bare Windows Terminal
+# pane uses wt-<WT_SESSION> (OMP writes that key file), falling back to tty.
+if [[ -n "${TMUX:-}" ]]; then
+  # Inside tmux: ONLY the pane's own tty is authoritative.
+  if [[ -n "$cur_tty" ]]; then
+    _omp_tty_key="${cur_tty//\//-}"   # pts/3 -> pts-3
+    if [[ -f "$OMP_SESSIONS/$_omp_tty_key" ]]; then
+      omp_src="$(sed -n '2p' "$OMP_SESSIONS/$_omp_tty_key" 2>/dev/null)"
+      if [[ -n "$omp_src" && -f "$omp_src" ]]; then
+        session_backend="omp"
+      fi
+    fi
+  fi
+else
+  # Bare terminal (no tmux). On Windows Terminal (WSL), OMP writes a
+  # wt-<WT_SESSION> key file — prefer it, then fall back to tty.
+  if [[ -n "${WT_SESSION:-}" ]]; then
+    _omp_wt_key="wt-${WT_SESSION}"
+    if [[ -f "$OMP_SESSIONS/$_omp_wt_key" ]]; then
+      omp_src="$(sed -n '2p' "$OMP_SESSIONS/$_omp_wt_key" 2>/dev/null)"
+      if [[ -n "$omp_src" && -f "$omp_src" ]]; then
+        session_backend="omp"
+      fi
+    fi
+  fi
+  if [[ -z "$session_backend" && -n "$cur_tty" ]]; then
+    _omp_tty_key="${cur_tty//\//-}"   # pts/3 -> pts-3
+    if [[ -f "$OMP_SESSIONS/$_omp_tty_key" ]]; then
+      omp_src="$(sed -n '2p' "$OMP_SESSIONS/$_omp_tty_key" 2>/dev/null)"
+      if [[ -n "$omp_src" && -f "$omp_src" ]]; then
+        session_backend="omp"
+      fi
+    fi
   fi
 fi
 
@@ -170,24 +226,31 @@ if [[ -z "$session_backend" ]]; then
       [[ -n "$claude_sid" ]] && session_backend="claude"
     fi
   fi
+  # WSL: tty-keyed claude mapping (written by --record above)
+  if [[ -z "$session_backend" && -n "$cur_tty" ]]; then
+    _claude_tty_key="${cur_tty//\//-}"
+    if [[ -f "$state/claude/$_claude_tty_key" ]]; then
+      claude_sid="$(sed -n '1p' "$state/claude/$_claude_tty_key" 2>/dev/null)"
+      [[ -n "$claude_sid" ]] && session_backend="claude"
+    fi
+  fi
 fi
 
 if [[ -z "$session_backend" ]]; then
-  print -u2 -r -- "branchnew: no active session found on this pane."
-  print -u2 -r -- "  (OMP: no ~/.omp/agent/terminal-sessions/$cur_tty; Claude: no \$CLAUDE_CODE_SESSION_ID / mapping)"
+  printf '%s\n' "branchnew: no active session found on this pane." >&2
+  printf '%s\n' "  (OMP: no $OMP_SESSIONS/<tty>; Claude: no \$CLAUDE_CODE_SESSION_ID / mapping)" >&2
   exit 1
 fi
 
 # ── Build the fork command per backend ───────────────────────────────────────
-q() { print -r -- "${(q)1}" }
+# POSIX single-quote escaping (replaces zsh ${(q)1})
+q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
 if [[ "$session_backend" == "omp" ]]; then
   # OMP: fork via --fork <jsonl>. Name via terminal-injected /rename (no --name flag).
-  # The /rename goes through the TUI input path (input-controller → handleRenameCommand),
-  # NOT session.prompt(), so the builtin command executes correctly.
   fork_cmd="cd $(q "$PWD") && omp --fork $(q "$omp_src")"
   rename_cmd="/rename $(q "$name")"
-  print -u2 -r -- "branchnew: backend=omp, fork then /rename after ${OMP_DELAY}s"
+  printf '%s\n' "branchnew: backend=omp, fork then /rename after ${OMP_DELAY}s" >&2
 else
   # Claude Code: --resume <sid> --fork-session --name <name> (name via flag).
   if [[ -n "$claude_sid" ]]; then
@@ -197,15 +260,15 @@ else
   fi
   fork_cmd="cd $(q "$PWD") && claude ${resume_flag} --fork-session --name $(q "$name")"
   rename_cmd=""
-  print -u2 -r -- "branchnew: backend=claude, --fork-session --name"
+  printf '%s\n' "branchnew: backend=claude, --fork-session --name" >&2
 fi
 
 # Debug aid: BRANCHNEW_DRYRUN=1 prints what would run and opens nothing.
 if [[ -n "${BRANCHNEW_DRYRUN:-}" ]]; then
-  local direction="right"; (( split_down )) && direction="down"
-  print -r -- "[dry-run] tty=${cur_tty:-none} backend=$session_backend direction=$direction"
-  print -r -- "[dry-run] fork:    $fork_cmd"
-  [[ -n "$rename_cmd" ]] && print -r -- "[dry-run] rename:  $rename_cmd (after ${OMP_DELAY}s)"
+  direction="right"; (( split_down )) && direction="down"
+  printf '%s\n' "[dry-run] tty=${cur_tty:-none} backend=$session_backend direction=$direction"
+  printf '%s\n' "[dry-run] fork:    $fork_cmd"
+  [[ -n "$rename_cmd" ]] && printf '%s\n' "[dry-run] rename:  $rename_cmd (after ${OMP_DELAY}s)"
   exit 0
 fi
 
@@ -215,14 +278,13 @@ fi
 launch_tmux() {
   local flag="-h"
   (( split_down )) && flag="-v"
-  tmux split-window "$flag" -c "$PWD" || return 1
-  tmux send-keys "$fork_cmd" Enter
+  local new_pane
+  new_pane="$(tmux split-window "$flag" -c "$PWD" -P -F '#{pane_id}' 2>/dev/null)" || return 1
+  tmux send-keys -t "$new_pane" "$fork_cmd" Enter
   if [[ -n "$rename_cmd" ]]; then
-    # Schedule the /rename after OMP_DELAY into the newly-created pane.
-    # tmux: the new pane is at {right} (or {down}) relative to the active pane.
-    local target='{right}'
-    (( split_down )) && target='{down}'
-    ( sleep "$OMP_DELAY" && tmux send-keys -t "$target" "$rename_cmd" Enter ) &!
+    # Schedule the /rename after OMP_DELAY into the newly-created pane,
+    # targeted by its explicit pane id (robust against focus/layout changes).
+    ( sleep "$OMP_DELAY" && tmux send-keys -t "$new_pane" "$rename_cmd" Enter ) &
   fi
 }
 
@@ -258,11 +320,6 @@ launch_iterm() {
 launch_ghostty() {
   local dir="right"
   (( split_down )) && dir="down"
-  # Ghostty AppleScript: input text takes the full string with linefeed.
-  # Keep the whole split + (optional) delayed /rename in ONE osascript call so
-  # the `newTerm` pane reference stays valid — a second backgrounded osascript
-  # would have to re-resolve the pane by focus, which breaks if the user (or
-  # focus-stealing) switches panes during the OMP_DELAY window.
   osascript \
     -e 'on run argv' \
     -e 'set cmd to item 1 of argv' \
@@ -288,6 +345,27 @@ launch_ghostty() {
     "$fork_cmd" "$dir" "${rename_cmd:+1}" "$rename_cmd" "$OMP_DELAY" 2>&1 >/dev/null
 }
 
+launch_wt() {
+  # Windows Terminal (WSL): use wt.exe split-pane. The new pane must re-enter
+  # WSL explicitly via wsl.exe (don't rely on profile duplication — the new
+  # pane's shell needs to run the fork command directly).
+  local dir_flag="-V"   # -V splits vertically => new pane on the right
+  (( split_down )) && dir_flag="-H"
+  local distro="${WSL_DISTRO_NAME:-}"
+  local wsl_args=()
+  [[ -n "$distro" ]] && wsl_args+=(-d "$distro")
+  # Convert $PWD to a Windows path for --cd (wslpath -w)
+  local win_cwd
+  win_cwd="$(wslpath -w "$PWD" 2>/dev/null || printf '%s' "$PWD")"
+  # Build the command: wsl.exe --cd <cwd> -e bash -lc '<fork_cmd>'
+  # The fork_cmd is already shell-quoted; wrap in bash -lc.
+  wt.exe split-pane "$dir_flag" -d "$win_cwd" wsl.exe "${wsl_args[@]}" -e bash -lc "$fork_cmd" 2>/dev/null
+  # WT can't send delayed /rename to a specific pane reliably; warn for OMP.
+  if [[ -n "$rename_cmd" ]]; then
+    printf '%s\n' "branchnew: (WT mode — auto /rename skipped; run '/rename $name' manually in the new pane)" >&2
+  fi
+}
+
 launch_terminal_window() {
   osascript \
     -e 'on run argv' \
@@ -300,15 +378,19 @@ launch_terminal_window() {
     "$fork_cmd" 2>&1 >/dev/null
   # Terminal can't target a pane for delayed input reliably; skip rename in this mode.
   if [[ -n "$rename_cmd" ]]; then
-    print -u2 -r -- "branchnew: (Terminal window mode — auto /rename skipped; run '/rename $name' manually in the new window)"
+    printf '%s\n' "branchnew: (Terminal window mode — auto /rename skipped; run '/rename $name' manually in the new window)" >&2
   fi
 }
 
 fail() {
-  print -u2 -r -- "branchnew: could not open the new view."
-  [[ -n "${1:-}" ]] && print -u2 -r -- "$1"
-  print -u2 -r -- "(Is your terminal allowed to run AppleScript? System Settings ›"
-  print -u2 -r -- " Privacy & Security › Automation.)"
+  printf '%s\n' "branchnew: could not open the new view." >&2
+  [[ -n "${1:-}" ]] && printf '%s\n' "$1" >&2
+  if [[ "$(uname)" == "Darwin" ]]; then
+    printf '%s\n' "(Is your terminal allowed to run AppleScript? System Settings ›" >&2
+    printf '%s\n' " Privacy & Security › Automation.)" >&2
+  else
+    printf '%s\n' "(Check that wt.exe / tmux is available and on PATH.)" >&2
+  fi
   exit 1
 }
 
@@ -325,15 +407,22 @@ case "${TERM_PROGRAM:-}" in
     if ! err="$(launch_ghostty)"; then fail "$err"; fi
     ;;
   Apple_Terminal)
-    print -u2 -r -- "branchnew: Apple Terminal can't split panes — opening a new window instead."
-    print -u2 -r -- "          (run inside tmux, or use iTerm2, for a real split.)"
+    printf '%s\n' "branchnew: Apple Terminal can't split panes — opening a new window instead." >&2
+    printf '%s\n' "          (run inside tmux, or use iTerm2, for a real split.)" >&2
     if ! err="$(launch_terminal_window)"; then fail "$err"; fi
     ;;
   *)
-    print -u2 -r -- "branchnew: terminal '${TERM_PROGRAM:-unknown}' can't be scripted directly —"
-    print -u2 -r -- "          opening a new Apple Terminal window. For an in-place split, run"
-    print -u2 -r -- "          branchnew inside tmux, or use iTerm2."
-    if ! err="$(launch_terminal_window)"; then fail "$err"; fi
+    # WSL / Windows Terminal: WT_SESSION is set when running inside Windows Terminal.
+    if [[ -n "${WT_SESSION:-}" ]] || command -v wt.exe >/dev/null 2>&1; then
+      if ! err="$(launch_wt)"; then fail "$err"; fi
+    elif [[ "$(uname)" == "Darwin" ]]; then
+      printf '%s\n' "branchnew: terminal '${TERM_PROGRAM:-unknown}' can't be scripted directly —" >&2
+      printf '%s\n' "          opening a new Apple Terminal window. For an in-place split, run" >&2
+      printf '%s\n' "          branchnew inside tmux, or use iTerm2." >&2
+      if ! err="$(launch_terminal_window)"; then fail "$err"; fi
+    else
+      fail "no supported terminal backend (install tmux, or run inside Windows Terminal)."
+    fi
     ;;
 esac
 
