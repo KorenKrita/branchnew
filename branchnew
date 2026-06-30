@@ -346,21 +346,36 @@ launch_ghostty() {
 }
 
 launch_wt() {
-  # Windows Terminal (WSL): use wt.exe split-pane. The new pane must re-enter
-  # WSL explicitly via wsl.exe (don't rely on profile duplication — the new
-  # pane's shell needs to run the fork command directly).
+  # Windows Terminal (WSL): wt.exe split-pane in the CURRENT window (-w 0).
+  # The new pane re-enters WSL via wsl.exe and runs the fork command.
+  #
+  # A fresh wsl.exe instance has a minimal PATH (from /etc/environment) and does
+  # NOT inherit the current shell's env (OMP injects ~/.bun/bin etc. at launch).
+  # Prepend the user's local bins so omp/claude/bun are findable. bun is needed
+  # because omp is a bun script (#!/usr/bin/env bun).
+  #
+  # To avoid quote-mangling through the WSL→Windows→WSL interop chain, write
+  # the full command (PATH export + fork_cmd) into a temp script and have the
+  # new pane execute that script directly.
   local dir_flag="-V"   # -V splits vertically => new pane on the right
   (( split_down )) && dir_flag="-H"
   local distro="${WSL_DISTRO_NAME:-}"
   local wsl_args=()
   [[ -n "$distro" ]] && wsl_args+=(-d "$distro")
-  # Convert $PWD to a Windows path for --cd (wslpath -w)
   local win_cwd
   win_cwd="$(wslpath -w "$PWD" 2>/dev/null || printf '%s' "$PWD")"
-  # Build the command: wsl.exe --cd <cwd> -e bash -lc '<fork_cmd>'
-  # The fork_cmd is already shell-quoted; wrap in bash -lc.
-  wt.exe split-pane "$dir_flag" -d "$win_cwd" wsl.exe "${wsl_args[@]}" -e bash -lc "$fork_cmd" 2>/dev/null
-  # WT can't send delayed /rename to a specific pane reliably; warn for OMP.
+  # Write the fork into a self-deleting temp script.
+  local script
+  script="$(mktemp /tmp/branchnew-fork-XXXXXX.sh)"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'trap "rm -f %q" EXIT\n' "$script"
+    printf 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"\n'
+    printf '%s\n' "$fork_cmd"
+  } > "$script"
+  chmod +x "$script"
+  # -w 0 targets the current WT window.
+  wt.exe -w 0 split-pane "$dir_flag" -d "$win_cwd" wsl.exe "${wsl_args[@]}" -e "$script" 2>/dev/null
   if [[ -n "$rename_cmd" ]]; then
     printf '%s\n' "branchnew: (WT mode — auto /rename skipped; run '/rename $name' manually in the new pane)" >&2
   fi
