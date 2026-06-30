@@ -11,8 +11,8 @@
 # Base install : the `branchnew` command + the `/branchnew` slash command.
 # --hotkey also: wires the hotkey fork for your platform:
 #   macOS  : iTerm2 ⌘F daemon + Ghostty fork script + Claude hooks
-#   WSL/WT : tmux bind-key (reliable, both OMP & Claude) + WT sendInput snippet
-#            (degraded: Claude-only via /branchnew; OMP needs idle shell)
+#   WSL/WT : tmux bind-key (reliable) + AutoHotkey system hotkey (WT-scoped,
+#            sends /branchnew to the focused pane; both OMP & Claude register it)
 #   Linux  : tmux bind-key
 #
 set -euo pipefail
@@ -38,7 +38,7 @@ if [[ -z "$SRC_DIR" || ! -f "$SRC_DIR/branchnew" ]]; then
   SRC_DIR="$(mktemp -d)"
   trap 'rm -rf "$SRC_DIR"' EXIT
   echo "↓ downloading branchnew from GitHub…"
-  for f in branchnew branchnew-hotkey commands/branchnew.md iterm2/claude_fork.py ghostty/fork.sh; do
+  for f in branchnew branchnew-hotkey commands/branchnew.md commands/branchnew-omp.md windows/branchnew-hotkey.ahk iterm2/claude_fork.py ghostty/fork.sh; do
     mkdir -p "$SRC_DIR/$(dirname "$f")"
     curl -fsSL "$REPO_RAW/$f" -o "$SRC_DIR/$f"
   done
@@ -80,6 +80,13 @@ CMD_DIR="$HOME/.claude/commands"
 mkdir -p "$CMD_DIR"
 install -m 0644 "$SRC_DIR/commands/branchnew.md" "$CMD_DIR/branchnew.md"
 echo "✓ installed /branchnew slash command"
+
+# 2b) the /branchnew slash command for OMP (native provider, ~/.omp/agent/commands/)
+#     Different body format than Claude's (prompt template, no !backtick).
+OMP_CMD_DIR="$HOME/.omp/agent/commands"
+mkdir -p "$OMP_CMD_DIR"
+install -m 0644 "$SRC_DIR/commands/branchnew-omp.md" "$OMP_CMD_DIR/branchnew.md"
+echo "✓ installed /branchnew slash command for OMP"
 
 command -v claude >/dev/null 2>&1 || echo "! note: 'claude' is not on PATH — install Claude Code."
 
@@ -169,16 +176,30 @@ PY
       echo "✓ tmux bind-key already wired in $TMUX_CONF"
     fi
 
-    # WSL / Windows Terminal degraded fallback: sendInput snippet
+    # WSL / Windows Terminal: AutoHotkey system hotkey + WT sendInput option.
+    # Both OMP and Claude register /branchnew, so sending "/branchnew\r" to the
+    # focused pane works in either TUI (the TUI expands it as a slash command,
+    # it is not swallowed as a raw prompt).
     if [[ "$is_wsl" == 1 ]]; then
+      # Install the AHK script to a Windows-accessible location.
+      AHK_DEST="$HOME/.branchnew"
+      mkdir -p "$AHK_DEST"
+      install -m 0644 "$SRC_DIR/windows/branchnew-hotkey.ahk" "$AHK_DEST/branchnew-hotkey.ahk" 2>/dev/null || true
+      # Try to resolve a Windows path for the hint (wslpath may not be present).
+      AHK_WIN_PATH="$(wslpath -w "$AHK_DEST/branchnew-hotkey.ahk" 2>/dev/null || printf '%s\\branchnew-hotkey.ahk' "$AHK_DEST")"
       echo
-      echo "Windows Terminal degraded hotkey (no tmux needed, Claude-only):"
-      echo "  Add to WT settings.json → actions + keybindings (Ctrl+Shift+F):"
+      echo "Windows Terminal system hotkey (AutoHotkey, works for OMP & Claude):"
+      echo "  ✓ AHK script installed: $AHK_DEST/branchnew-hotkey.ahk"
+      echo "  To enable:"
+      echo "    1. Install AutoHotkey v2 (https://www.autohotkey.com/) on Windows"
+      echo "    2. Run: $AHK_WIN_PATH"
+      echo "    3. In Windows Terminal, Ctrl+Shift+F forks right, Ctrl+Shift+Alt+F forks down"
+      echo "  (The hotkey only fires when a Windows Terminal window is focused.)"
+      echo
+      echo "  Alternative (no AutoHotkey) — add to WT settings.json actions+keybindings:"
       echo '    { "command": { "action": "sendInput", "input": "/branchnew\r" }, "id": "User.BranchnewFork" }'
       echo '    { "keys": "ctrl+shift+f", "id": "User.BranchnewFork" }'
-      echo "  Note: this only works in a Claude Code pane (Claude recognizes /branchnew)."
-      echo "  OMP has that slash command disabled, so in an OMP pane the chars would be"
-      echo "  swallowed by the TUI as a prompt. For OMP, use the tmux bind-key above."
+      echo "  (Same effect, WT-native; also works for both OMP and Claude.)"
       echo
     fi
   fi
