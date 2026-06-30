@@ -369,13 +369,28 @@ launch_wt() {
   script="$(mktemp /tmp/branchnew-fork-XXXXXX.sh)"
   {
     printf '#!/usr/bin/env bash\n'
-    printf 'trap "rm -f %q" EXIT\n' "$script"
+    # bash has read this script into memory by the time it runs; delete the
+    # file now so temp scripts don't pile up (the forked TUI never exits, so
+    # a trap-on-EXIT would never fire).
+    printf 'rm -f "$0"\n'
     printf 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"\n'
     printf '%s\n' "$fork_cmd"
   } > "$script"
   chmod +x "$script"
-  # -w 0 targets the current WT window.
-  wt.exe -w 0 split-pane "$dir_flag" -d "$win_cwd" wsl.exe "${wsl_args[@]}" -e "$script" 2>/dev/null
+  # Resolve wt.exe to an absolute path — the OMP /branchnew bash subprocess
+  # may not have WindowsApps on PATH.
+  local WT_EXE
+  WT_EXE="$(command -v wt.exe 2>/dev/null)" || \
+    WT_EXE="/mnt/c/Users/${USER:-$(whoami)}/AppData/Local/Microsoft/WindowsApps/wt.exe"
+  [[ -x "$WT_EXE" ]] || WT_EXE="$(ls /mnt/c/Users/*/AppData/Local/Microsoft/WindowsApps/wt.exe 2>/dev/null | head -1)"
+
+  # -w 0 targets the current WT window. Don't swallow stderr — if split-pane
+  # fails (e.g. no room to split), we want to see why.
+  wt_err="$("$WT_EXE" -w 0 split-pane "$dir_flag" -d "$win_cwd" wsl.exe "${wsl_args[@]}" -e "$script" 2>&1)"
+  local wt_rc=$?
+  if [[ $wt_rc -ne 0 || -n "$wt_err" ]]; then
+    printf '%s\n' "branchnew: wt.exe split-pane failed (exit=$wt_rc): $wt_err" >&2
+  fi
   if [[ -n "$rename_cmd" ]]; then
     printf '%s\n' "branchnew: (WT mode — auto /rename skipped; run '/rename $name' manually in the new pane)" >&2
   fi
