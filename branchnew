@@ -1,9 +1,7 @@
 #!/bin/zsh
 #
 # branchnew — split the current terminal to the right and continue the current
-# Claude Code session there as an independent FORK, so you get a second view with
-# the same context right next to where you're working. Your current pane is left
-# untouched.
+# session there as an independent FORK. Supports both Claude Code and OMP.
 #
 # Usage:
 #   branchnew            split right + fork, auto-named newBranch1, newBranch2, …
@@ -17,25 +15,30 @@
 # Ghostty (AppleScript split) > Apple Terminal (can't split → new window) >
 # anything else (new Terminal window).
 #
-# The fork's name is set with `claude --name`, shown in the new session's prompt
-# box, /resume picker, and terminal title. The auto counter is stored in
-# ${XDG_STATE_HOME:-~/.local/state}/branchnew/counter.
+# Session backend auto-detected: OMP (via ~/.omp/agent/terminal-sessions/<tty>)
+# > Claude Code (via $CLAUDE_CODE_SESSION_ID or branchnew mapping) > fallback.
 #
-# When run inside a Claude session ($CLAUDE_CODE_SESSION_ID set), it forks THAT
-# exact session. Otherwise it forks the most recent session in $PWD.
+# - Claude Code: `claude --resume <sid> --fork-session --name <name>` (name via flag)
+# - OMP: `omp --fork <jsonl>` + terminal-injected `/rename <name>` (name via send-keys,
+#   since OMP has no --name flag and hook/extension can't setSessionName at fork time)
+#
+# The auto counter is stored in ${XDG_STATE_HOME:-~/.local/state}/branchnew/counter.
+# OMP fork needs ~1.5-2s TUI startup before /rename can be accepted; the delay is
+# BRANCHNEW_OMP_DELAY (default 2).
 
 emulate -L zsh
 
+state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
+OMP_SESSIONS="$HOME/.omp/agent/terminal-sessions"
+OMP_DELAY="${BRANCHNEW_OMP_DELAY:-2}"
+
 # ── Internal: `branchnew --record` — called by Claude hooks (SessionStart /
 # UserPromptSubmit) to remember which Claude session lives in which terminal
-# pane. Used by the hotkey fork daemons (iTerm2: iterm2/claude_fork.py, Ghostty:
-# ghostty/fork.sh) to fork the exact session. Not for interactive use.
-# Writes mapping to iterm/<guid> and/or ghostty/<tty>.
+# pane. Used by the hotkey fork daemons. Not for interactive use.
+# (OMP maintains its own terminal-sessions/<tty> mapping; this is Claude-only.)
 if [[ "${1:-}" == "--record" ]]; then
-  state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
   mkdir -p "$state/iterm" "$state/ghostty" 2>/dev/null
 
-  # Hook JSON (session_id / cwd / hook_event_name / transcript_path) on stdin.
   json_sid="" cwd="" event="" tpath=""
   if [[ ! -t 0 ]]; then
     json="$(cat 2>/dev/null)"
@@ -55,21 +58,17 @@ except Exception:
     fi
   fi
 
-  # Prefer the transcript-derived id (the real .jsonl in use) so a fork resolves
-  # to the FORK's own id; then the live env id; then the JSON session_id.
   tid=""
   [[ -n "$tpath" ]] && tid="${tpath:t:r}"
   sid="${tid:-${CLAUDE_CODE_SESSION_ID:-$json_sid}}"
   [[ -n "$cwd" ]] || cwd="${PWD:-}"
 
-  # ── iTerm2: pane GUID from $ITERM_SESSION_ID ──
   src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
   guid="${src##*:}"
   if [[ -n "$guid" && -n "$sid" ]]; then
     { print -r -- "$sid"; print -r -- "$cwd"; } > "$state/iterm/$guid"
   fi
 
-  # ── Ghostty: TTY as pane identifier (from parent claude process) ──
   gtty=""
   if [[ "${TERM_PROGRAM:-}" == "ghostty" && -n "$sid" ]]; then
     gtty="$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')"
@@ -88,13 +87,15 @@ split_down=0
 case "${1:-}" in
   -h|--help|help)
     print -r -- "Usage:"
-    print -r -- "  branchnew            split right + fork the current Claude session,"
+    print -r -- "  branchnew            split right + fork the current session,"
     print -r -- "                       auto-named newBranch1, newBranch2, … (a counter)"
     print -r -- "  branchnew <name>     same, but name the new session <name>"
     print -r -- "  branchnew --down     split down instead of right"
     print -r -- "  branchnew --help     show this help"
     print -r -- ""
     print -r -- "Backend auto-detected: tmux > iTerm2 > Ghostty > Apple Terminal > new Terminal window."
+    print -r -- "Session: OMP (~/.omp/agent/terminal-sessions) > Claude Code (\$CLAUDE_CODE_SESSION_ID)."
+    print -r -- "  OMP fork names via terminal-injected /rename (delay \${BRANCHNEW_OMP_DELAY:-2}s)."
     exit 0
     ;;
   --down)
@@ -104,15 +105,12 @@ case "${1:-}" in
 esac
 
 if (( $# > 0 )); then
-  # Custom name: everything you typed (so multi-word names work without quotes).
   name="$*"
 else
-  # Auto name: newBranch<N>, N from a global, persistent, incrementing counter.
-  state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
-  mkdir -p "$state_dir" 2>/dev/null
-  counter_file="$state_dir/counter"
+  mkdir -p "$state" 2>/dev/null
+  counter_file="$state/counter"
   cur="$(cat "$counter_file" 2>/dev/null)"
-  [[ "$cur" == <-> ]] || cur=0                 # reset if missing / non-numeric
+  [[ "$cur" == <-> ]] || cur=0
   n=$(( cur + 1 ))
   print -r -- "$n" > "$counter_file" 2>/dev/null
   name="newBranch${n}"
@@ -120,29 +118,112 @@ fi
 
 print -u2 -r -- "branchnew: new branch session → ${name}"
 
-# When running inside a Claude session, use --resume <id> to fork THIS EXACT
-# session (not just the most recent in $PWD). Falls back to --continue otherwise.
-if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
-  resume_flag="--resume ${(q)CLAUDE_CODE_SESSION_ID}"
+# ── Detect session backend: OMP vs Claude Code ───────────────────────────────
+# Get current tty (for OMP mapping lookup). `tty` returns "not a tty" (with
+# spaces) and exits non-zero when there's no controlling tty — e.g. when run
+# from inside an OMP /command (the bash tool subprocess has no tty). Walk UP
+# the process tree until we find a process whose tty starts with "ttys".
+cur_tty=""
+cur_tty="$(tty 2>/dev/null)"
+if [[ "$cur_tty" == *ttys* ]]; then
+  cur_tty="${cur_tty##*/}"
 else
-  resume_flag="--continue"
+  cur_tty=""
+  _walk_pid=$$
+  for _ in {1..8}; do
+    [[ -z "$_walk_pid" || "$_walk_pid" == "1" ]] && break
+    _t="$(ps -o tty= -p "$_walk_pid" 2>/dev/null | tr -d ' ')"
+    if [[ "$_t" == ttys* ]]; then
+      cur_tty="$_t"
+      break
+    fi
+    _walk_pid="$(ps -o ppid= -p "$_walk_pid" 2>/dev/null | tr -d ' ')"
+  done
+  unset _walk_pid _t
 fi
-cmd="cd ${(q)PWD} && claude ${resume_flag} --fork-session --name ${(q)name}"
+
+session_backend=""
+omp_src=""
+claude_sid=""
+
+# 1) OMP: ~/.omp/agent/terminal-sessions/<tty> — line 2 is the jsonl path
+if [[ -n "$cur_tty" && -f "$OMP_SESSIONS/$cur_tty" ]]; then
+  omp_src="$(sed -n '2p' "$OMP_SESSIONS/$cur_tty" 2>/dev/null)"
+  if [[ -n "$omp_src" && -f "$omp_src" ]]; then
+    session_backend="omp"
+  fi
+fi
+
+# 2) Claude Code: $CLAUDE_CODE_SESSION_ID (live env) or branchnew mapping
+if [[ -z "$session_backend" ]]; then
+  if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+    claude_sid="$CLAUDE_CODE_SESSION_ID"
+    session_backend="claude"
+  elif [[ -n "$cur_tty" && -f "$state/ghostty/$cur_tty" ]]; then
+    claude_sid="$(sed -n '1p' "$state/ghostty/$cur_tty" 2>/dev/null)"
+    [[ -n "$claude_sid" ]] && session_backend="claude"
+  else
+    src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
+    guid="${src##*:}"
+    if [[ -n "$guid" && -f "$state/iterm/$guid" ]]; then
+      claude_sid="$(sed -n '1p' "$state/iterm/$guid" 2>/dev/null)"
+      [[ -n "$claude_sid" ]] && session_backend="claude"
+    fi
+  fi
+fi
+
+if [[ -z "$session_backend" ]]; then
+  print -u2 -r -- "branchnew: no active session found on this pane."
+  print -u2 -r -- "  (OMP: no ~/.omp/agent/terminal-sessions/$cur_tty; Claude: no \$CLAUDE_CODE_SESSION_ID / mapping)"
+  exit 1
+fi
+
+# ── Build the fork command per backend ───────────────────────────────────────
+q() { print -r -- "${(q)1}" }
+
+if [[ "$session_backend" == "omp" ]]; then
+  # OMP: fork via --fork <jsonl>. Name via terminal-injected /rename (no --name flag).
+  # The /rename goes through the TUI input path (input-controller → handleRenameCommand),
+  # NOT session.prompt(), so the builtin command executes correctly.
+  fork_cmd="cd $(q "$PWD") && omp --fork $(q "$omp_src")"
+  rename_cmd="/rename $(q "$name")"
+  print -u2 -r -- "branchnew: backend=omp, fork then /rename after ${OMP_DELAY}s"
+else
+  # Claude Code: --resume <sid> --fork-session --name <name> (name via flag).
+  if [[ -n "$claude_sid" ]]; then
+    resume_flag="--resume $(q "$claude_sid")"
+  else
+    resume_flag="--continue"
+  fi
+  fork_cmd="cd $(q "$PWD") && claude ${resume_flag} --fork-session --name $(q "$name")"
+  rename_cmd=""
+  print -u2 -r -- "branchnew: backend=claude, --fork-session --name"
+fi
 
 # Debug aid: BRANCHNEW_DRYRUN=1 prints what would run and opens nothing.
 if [[ -n "${BRANCHNEW_DRYRUN:-}" ]]; then
   local direction="right"; (( split_down )) && direction="down"
-  print -r -- "[dry-run] TMUX=${TMUX:+set} TERM_PROGRAM=${TERM_PROGRAM:-unknown} direction=$direction"
-  print -r -- "[dry-run] command: $cmd"
+  print -r -- "[dry-run] tty=${cur_tty:-none} backend=$session_backend direction=$direction"
+  print -r -- "[dry-run] fork:    $fork_cmd"
+  [[ -n "$rename_cmd" ]] && print -r -- "[dry-run] rename:  $rename_cmd (after ${OMP_DELAY}s)"
   exit 0
 fi
 
 # ── Backends — always a split to the right, or the closest each one can do. ────
+# For OMP we send fork_cmd, then sleep, then /rename. For Claude, fork_cmd carries the name.
+
 launch_tmux() {
   local flag="-h"
   (( split_down )) && flag="-v"
   tmux split-window "$flag" -c "$PWD" || return 1
-  tmux send-keys "claude ${resume_flag} --fork-session --name ${(q)name}" Enter
+  tmux send-keys "$fork_cmd" Enter
+  if [[ -n "$rename_cmd" ]]; then
+    # Schedule the /rename after OMP_DELAY into the newly-created pane.
+    # tmux: the new pane is at {right} (or {down}) relative to the active pane.
+    local target='{right}'
+    (( split_down )) && target='{down}'
+    ( sleep "$OMP_DELAY" && tmux send-keys -t "$target" "$rename_cmd" Enter ) &!
+  fi
 }
 
 launch_iterm() {
@@ -152,6 +233,9 @@ launch_iterm() {
     -e 'on run argv' \
     -e 'set cmd to item 1 of argv' \
     -e 'set dir to item 2 of argv' \
+    -e 'set hasRename to item 3 of argv' \
+    -e 'set renameCmd to item 4 of argv' \
+    -e 'set dly to item 5 of argv' \
     -e 'tell application "iTerm"' \
     -e '  activate' \
     -e '  tell current session of current window' \
@@ -162,18 +246,30 @@ launch_iterm() {
     -e '    end if' \
     -e '  end tell' \
     -e '  tell s to write text cmd' \
+    -e '  if hasRename is "1" then' \
+    -e '    delay dly' \
+    -e '    tell s to write text renameCmd' \
+    -e '  end if' \
     -e 'end tell' \
     -e 'end run' \
-    "$cmd" "$dir" 2>&1 >/dev/null
+    "$fork_cmd" "$dir" "${rename_cmd:+1}" "$rename_cmd" "$OMP_DELAY" 2>&1 >/dev/null
 }
 
 launch_ghostty() {
   local dir="right"
   (( split_down )) && dir="down"
+  # Ghostty AppleScript: input text takes the full string with linefeed.
+  # Keep the whole split + (optional) delayed /rename in ONE osascript call so
+  # the `newTerm` pane reference stays valid — a second backgrounded osascript
+  # would have to re-resolve the pane by focus, which breaks if the user (or
+  # focus-stealing) switches panes during the OMP_DELAY window.
   osascript \
     -e 'on run argv' \
-    -e 'set cmd to (item 1 of argv) & linefeed' \
+    -e 'set cmd to item 1 of argv' \
     -e 'set dir to item 2 of argv' \
+    -e 'set hasRename to item 3 of argv' \
+    -e 'set renameCmd to item 4 of argv' \
+    -e 'set dly to item 5 of argv' \
     -e 'tell application "Ghostty"' \
     -e '  set currentTerm to focused terminal of selected tab of front window' \
     -e '  if dir is "down" then' \
@@ -182,10 +278,14 @@ launch_ghostty() {
     -e '    set newTerm to split currentTerm direction right' \
     -e '  end if' \
     -e '  delay 0.3' \
-    -e '  input text cmd to newTerm' \
+    -e '  perform action ("text:" & cmd & (ASCII character 13)) on newTerm' \
+    -e '  if hasRename is "1" then' \
+    -e '    delay dly' \
+    -e '    input text renameCmd to newTerm' \
+    -e '  end if' \
     -e 'end tell' \
     -e 'end run' \
-    "$cmd" "$dir" 2>&1 >/dev/null
+    "$fork_cmd" "$dir" "${rename_cmd:+1}" "$rename_cmd" "$OMP_DELAY" 2>&1 >/dev/null
 }
 
 launch_terminal_window() {
@@ -197,7 +297,11 @@ launch_terminal_window() {
     -e '  do script cmd' \
     -e 'end tell' \
     -e 'end run' \
-    "$cmd" 2>&1 >/dev/null
+    "$fork_cmd" 2>&1 >/dev/null
+  # Terminal can't target a pane for delayed input reliably; skip rename in this mode.
+  if [[ -n "$rename_cmd" ]]; then
+    print -u2 -r -- "branchnew: (Terminal window mode — auto /rename skipped; run '/rename $name' manually in the new window)"
+  fi
 }
 
 fail() {
@@ -208,7 +312,6 @@ fail() {
   exit 1
 }
 
-# tmux first: if we're inside tmux it can split natively, whatever the terminal.
 if [[ -n "${TMUX:-}" ]]; then
   launch_tmux || fail "tmux refused to split the window."
   exit 0

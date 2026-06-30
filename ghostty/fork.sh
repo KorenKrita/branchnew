@@ -2,21 +2,26 @@
 #
 # ghostty/fork.sh — Ghostty hotkey fork script.
 #
-# Bind this to a global hotkey (Hammerspoon recommended) to fork the Claude
-# session in the currently focused Ghostty pane.
+# Bind this to a global hotkey (Hammerspoon recommended) to fork the session
+# in the currently focused Ghostty pane. Supports both OMP and Claude Code.
 #
 # Ghostty 1.3.2-tip+: uses `tty of terminal` for precise pane→session mapping.
 # Ghostty 1.3.1 (stable): falls back to `working directory` matching (best-effort).
 #
-# Mapping files live in ~/.local/state/branchnew/ghostty/<tty>, each containing:
-#   line 1: Claude session id
-#   line 2: working directory
+# Session backend auto-detected:
+#   OMP: ~/.omp/agent/terminal-sessions/<tty> (line 2 = session jsonl path)
+#   Claude: ~/.local/state/branchnew/ghostty/<tty> (line 1 = claude session id)
+#
+# - OMP: `omp --fork <jsonl>` + terminal-injected `/rename fork` (no --name flag)
+# - Claude: `claude --resume <sid> --fork-session -n fork` (name via flag)
 #
 emulate -L zsh
 setopt err_exit pipe_fail
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
 GHOSTTY_DIR="$STATE_DIR/ghostty"
+OMP_SESSIONS="$HOME/.omp/agent/terminal-sessions"
+OMP_DELAY="${BRANCHNEW_OMP_DELAY:-2}"
 LOG="$STATE_DIR/ghostty-fork.log"
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LOG" 2>/dev/null; }
@@ -44,18 +49,37 @@ lookup_by_tty() {
 
   [[ -n "$tty_key" ]] || return 1
 
-  local map_file="$GHOSTTY_DIR/$tty_key"
-  [[ -f "$map_file" ]] || return 1
+  # 1) OMP mapping: ~/.omp/agent/terminal-sessions/<tty> — line 2 is jsonl path
+  local omp_map="$OMP_SESSIONS/$tty_key"
+  if [[ -f "$omp_map" ]]; then
+    omp_src="$(sed -n '2p' "$omp_map" 2>/dev/null)"
+    if [[ -n "$omp_src" && -f "$omp_src" ]]; then
+      backend="omp"
+      cwd="$focus_cwd"
+      log "fork (tty): tty=$tty_key -> OMP session=$omp_src cwd=$cwd"
+      return 0
+    fi
+  fi
 
-  sid="$(sed -n '1p' "$map_file")"
-  cwd="$(sed -n '2p' "$map_file")"
-  [[ -n "$cwd" ]] || cwd="$focus_cwd"
-  [[ -n "$sid" ]] || return 1
+  # 2) Claude mapping: ~/.local/state/branchnew/ghostty/<tty> — line 1 is sid
+  local claude_map="$GHOSTTY_DIR/$tty_key"
+  if [[ -f "$claude_map" ]]; then
+    sid="$(sed -n '1p' "$claude_map")"
+    cwd="$(sed -n '2p' "$claude_map")"
+    [[ -n "$cwd" ]] || cwd="$focus_cwd"
+    if [[ -n "$sid" ]]; then
+      backend="claude"
+      log "fork (tty): tty=$tty_key -> Claude session=$sid cwd=$cwd"
+      return 0
+    fi
+  fi
 
-  log "fork (tty): tty=$tty_key -> session=$sid cwd=$cwd"
+  return 1
 }
 
 # ── Strategy B: cwd matching fallback (Ghostty 1.3.1 stable) ──
+# Only Claude uses branchnew's ghostty/ mapping dir; OMP's terminal-sessions
+# is tty-keyed only, so the cwd fallback is Claude-only.
 lookup_by_cwd() {
   local focus_cwd
   focus_cwd="$(osascript -e '
@@ -83,23 +107,23 @@ lookup_by_cwd() {
   done
 
   [[ -n "$best_sid" ]] || return 1
+  backend="claude"
   sid="$best_sid"
   cwd="$best_cwd"
-
-  log "fork (cwd fallback): cwd=$focus_cwd -> session=$sid"
+  log "fork (cwd fallback): cwd=$focus_cwd -> Claude session=$sid"
 }
 
 # ── Resolve session ──
-sid="" cwd=""
+backend="" sid="" omp_src="" cwd=""
 if has_tty_prop; then
-  lookup_by_tty
+  lookup_by_tty || lookup_by_cwd
 else
   lookup_by_cwd
 fi
 
-if [[ -z "$sid" ]]; then
-  log "no mapping found — open a Claude session in this pane first"
-  osascript -e 'display notification "No Claude session in this pane" with title "branchnew"' 2>/dev/null
+if [[ -z "$backend" ]]; then
+  log "no mapping found — open an OMP or Claude session in this pane first"
+  osascript -e 'display notification "No session in this pane" with title "branchnew"' 2>/dev/null
   exit 1
 fi
 
@@ -107,12 +131,25 @@ fi
 split_dir="right"
 [[ "${1:-}" == "--down" ]] && split_dir="down"
 
-# ── Split and fork ──
-osascript - "$cwd" "$sid" "$split_dir" <<'APPLESCRIPT'
+# ── Build fork command per backend ──
+q() { print -r -- "${(q)1}" }
+
+if [[ "$backend" == "omp" ]]; then
+  fork_cmd="cd $(q "$cwd") && omp --fork $(q "$omp_src")"
+  rename_cmd="/rename fork"
+else
+  fork_cmd="cd $(q "$cwd") && claude --resume $(q "$sid") --fork-session -n fork"
+  rename_cmd=""
+fi
+
+# ── Split and fork (single osascript keeps newTerm reference stable) ──
+osascript - "$fork_cmd" "$split_dir" "${rename_cmd:+1}" "$rename_cmd" "$OMP_DELAY" <<'APPLESCRIPT'
 on run argv
-  set cwd to item 1 of argv
-  set sid to item 2 of argv
-  set dir to item 3 of argv
+  set cmd to item 1 of argv
+  set dir to item 2 of argv
+  set hasRename to item 3 of argv
+  set renameCmd to item 4 of argv
+  set dly to item 5 of argv
 
   tell application "Ghostty"
     set currentTerm to focused terminal of selected tab of front window
@@ -122,8 +159,15 @@ on run argv
       set newTerm to split currentTerm direction right
     end if
     delay 0.3
-    set cmd to "cd " & quoted form of cwd & " && claude --resume " & quoted form of sid & " --fork-session -n fork"
-    input text (cmd & linefeed) to newTerm
+    -- fork command: raw pty write (no bracketed paste) + CR to execute
+    perform action ("text:" & cmd & (ASCII character 13)) on newTerm
+    if hasRename is "1" then
+      delay dly
+      -- /rename: just fill the input box (no CR) — user hits Enter manually.
+      -- (TUI submit can't be reliably triggered via pty write due to bracketed
+      -- paste / key-event translation limits; leaving it unsubmitted is robust.)
+      input text renameCmd to newTerm
+    end if
   end tell
 end run
 APPLESCRIPT
